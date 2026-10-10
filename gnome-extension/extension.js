@@ -224,33 +224,47 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
     }
 
     _toggleWatchdog(enable) {
-        if (enable) {
-            runCmd(['systemctl', '--user', 'restart', 'klu-watchdog.service'], () => this._refreshState());
-        } else {
-            runCmd(['systemctl', '--user', 'stop', 'klu-watchdog.service'], () => {
-                runCmd(['pkill', '-f', 'klu_wifi_watchdog.sh'], () => {
-                    runCmd(['nmcli', 'connection', 'modify', 'KLU_WIFI', '802-11-wireless.bssid', ''], () => this._refreshState());
-                });
-            });
+        this._isUpdating = true;
+        this._watchdogSwitch.setToggleState(enable);
+        if (this._extension && this._extension._quickIndicator && this._extension._quickIndicator._toggle) {
+            this._extension._quickIndicator._toggle.checked = enable;
+            this._extension._quickIndicator._toggle._qsWatchdogSwitch.setToggleState(enable);
         }
+        this._isUpdating = false;
+
+        let cmd;
+        if (enable) {
+            cmd = ['systemctl', '--user', 'restart', 'klu-watchdog.service'];
+        } else {
+            cmd = ['bash', '-c', 'systemctl --user stop klu-watchdog.service 2>/dev/null; pkill -9 -f klu_wifi_watchdog.sh 2>/dev/null; pkill -9 -f wifi-live-logs 2>/dev/null; nmcli connection modify KLU_WIFI 802-11-wireless.bssid "" 2>/dev/null || true'];
+        }
+
+        runCmd(cmd, () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+                this._refreshState();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
     }
 
     _toggleHotspot(enable) {
-        if (enable) {
-            runCmd(['pkexec', HOTSPOT_BIN, '--start'], () => {
-                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
-                    this._refreshState();
-                    return GLib.SOURCE_REMOVE;
-                });
-            });
-        } else {
-            runCmd(['pkexec', HOTSPOT_BIN, '--stop'], () => {
-                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
-                    this._refreshState();
-                    return GLib.SOURCE_REMOVE;
-                });
-            });
+        this._isUpdating = true;
+        this._hotspotSwitch.setToggleState(enable);
+        if (this._extension && this._extension._quickIndicator && this._extension._quickIndicator._toggle) {
+            this._extension._quickIndicator._toggle._qsHotspotSwitch.setToggleState(enable);
         }
+        this._isUpdating = false;
+
+        let cmd = enable
+            ? ['pkexec', HOTSPOT_BIN, '--start']
+            : ['pkexec', HOTSPOT_BIN, '--stop'];
+
+        runCmd(cmd, () => {
+            GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+                this._refreshState();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
     }
 
     _refreshState() {
@@ -302,8 +316,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
             this._hotspotSwitch.setToggleState(hs);
             this._isUpdating = false;
 
-            // Transparency: Badge is visible ONLY when watchdog is ON
-            this.visible = wd;
+            this.visible = true;
 
             if (wd) {
                 this._label.text = `KLU: ON (${band})`;
