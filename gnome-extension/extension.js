@@ -296,6 +296,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         `;
 
         runCmd(['bash', '-c', script], (ok, stdout) => {
+            if (this._destroyed || !this._watchdogSwitch) return;
             if (!ok || !stdout) return;
             let p = stdout.trim().split('|');
             if (p.length < 10) return;
@@ -346,12 +347,16 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
     _startPolling() {
         if (this._timeoutId > 0) GLib.Source.remove(this._timeoutId);
         this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
-            this._refreshState();
-            return GLib.SOURCE_CONTINUE;
+            if (!this._destroyed) {
+                this._refreshState();
+                return GLib.SOURCE_CONTINUE;
+            }
+            return GLib.SOURCE_REMOVE;
         });
     }
 
     destroy() {
+        this._destroyed = true;
         if (this._timeoutId > 0) {
             GLib.Source.remove(this._timeoutId);
             this._timeoutId = 0;
@@ -438,6 +443,7 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
     }
 
     setSubStatus(wd, hs, band) {
+        if (this._destroyed || !this._qsWatchdogSwitch) return;
         this._isUpdating = true;
         this.checked = wd;
         this._qsWatchdogSwitch.setToggleState(wd);
@@ -453,6 +459,11 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
             this.subtitle = 'Watchdog & Hotspot OFF';
         }
     }
+
+    destroy() {
+        this._destroyed = true;
+        super.destroy();
+    }
 });
 
 const KLUSwitchQuickIndicator = GObject.registerClass(
@@ -464,6 +475,7 @@ class KLUSwitchQuickIndicator extends QuickSettings.SystemIndicator {
     }
 
     destroy() {
+        this.quickSettingsItems = [];
         if (this._toggle) {
             this._toggle.destroy();
             this._toggle = null;
