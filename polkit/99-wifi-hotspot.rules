@@ -1,0 +1,7 @@
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "goutham" &&
+        action.lookup("unit").indexOf("wifi-hotspot@") === 0) {
+        return polkit.Result.YES;
+    }
+});

@@ -1,0 +1,13 @@
+[Unit]
+Description=Wi-Fi Hotspot Service for %i
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/start_hotspot %i
+ExecStartPost=/usr/local/bin/hotspot_post_start.sh %i
+ExecStop=/usr/local/bin/stop_hotspot %i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

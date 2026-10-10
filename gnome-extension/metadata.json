@@ -1,0 +1,14 @@
+{
+  "name": "KLU Switch",
+  "description": "Master Switch for KLU Wi-Fi Watchdog & Integrated High-Speed Hotspot Router",
+  "uuid": "klu-switch@goutham.github.com",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "version": 1
+}
