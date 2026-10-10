@@ -307,11 +307,11 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
 
             if (wd) {
                 this._label.text = `KLU: ON (${band})`;
-                this._label.set_style('font-weight: bold; margin-left: 4px; font-size: 11px; color: #2ec27e;');
+                this._label.set_style('font-weight: bold; margin-left: 4px; font-size: 11px; color: inherit;');
                 this._icon.icon_name = 'network-wireless-signal-excellent-symbolic';
             } else {
                 this._label.text = 'KLU: OFF';
-                this._label.set_style('font-weight: bold; margin-left: 4px; font-size: 11px; color: #e05f65;');
+                this._label.set_style('font-weight: bold; margin-left: 4px; font-size: 11px; color: inherit;');
                 this._icon.icon_name = 'network-wireless-offline-symbolic';
             }
 
