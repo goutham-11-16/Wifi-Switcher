@@ -102,38 +102,33 @@ case "$1" in
         ;;
 esac
 
-# Privilege check for start/stop
-if [ "$(id -u)" -ne 0 ]; then
-    if [ -t 0 ]; then
-        exec sudo "$0" "$@"
-    else
-        exec pkexec "$0" "$@"
-    fi
-fi
-
 # Stop Hotspot
 cmd_stop() {
-    echo "[*] Stopping KLU Hotspot..."
+    echo "[*] Stopping KLU Wi-Fi Hotspot..."
+
+    # Stop managed systemd service (passwordless via polkit for goutham)
+    systemctl stop wifi-hotspot@*.service 2>/dev/null || true
+
     if [ -f "$PID_FILE" ]; then
         local pid
         pid=$(cat "$PID_FILE" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
-            sleep 0.5
+            sleep 0.2
             kill -9 "$pid" 2>/dev/null || true
         fi
         rm -f "$PID_FILE" "$STATE_FILE"
     fi
 
-    # Only terminate standalone processes if not owned by main systemd service
-    if ! systemctl is-active --quiet wifi-hotspot@*.service 2>/dev/null && ! pgrep -f "start_hotspot" >/dev/null; then
-        pkill -9 -f "create_ap.*${AP_INTERFACE}" 2>/dev/null || true
-        pkill -9 -f "hostapd.*${AP_INTERFACE}" 2>/dev/null || true
-        iw dev "$AP_INTERFACE" del 2>/dev/null || true
-        ip link delete "$AP_INTERFACE" 2>/dev/null || true
-    fi
+    # Thorough cleanup of create_ap, hostapd, dnsmasq
+    pkill -9 -f "/usr/bin/create_ap" 2>/dev/null || true
+    pkill -9 -f "hostapd.*/tmp/create_ap" 2>/dev/null || true
+    pkill -9 -f "dnsmasq.*/tmp/create_ap" 2>/dev/null || true
+    iw dev "$AP_INTERFACE" del 2>/dev/null || true
+    ip link delete "$AP_INTERFACE" 2>/dev/null || true
 
-    rm -f /tmp/create_ap.*.lock /tmp/create_ap.${INTERFACE}.lock "$PID_FILE" "$STATE_FILE"
+    rm -f /tmp/create_ap.*.lock /tmp/create_ap.${INTERFACE}.lock /tmp/wifi-hotspot-active-mode "$PID_FILE" "$STATE_FILE"
+    rm -rf /tmp/create_ap.* 2>/dev/null || true
 
     echo "[+] KLU Hotspot stopped cleanly."
     send_notify "normal" "Hotspot Disabled" "KLU Hotspot has been stopped."
@@ -141,7 +136,22 @@ cmd_stop() {
 
 # Start Hotspot
 cmd_start() {
-    echo "[*] Starting KLU Standalone Hotspot..."
+    echo "[*] Starting KLU Wi-Fi Hotspot..."
+
+    # Clean up any stale state first
+    cmd_stop >/dev/null 2>&1
+    sleep 0.3
+
+    # Use the robust systemd service whenever available
+    if systemctl list-unit-files 2>/dev/null | grep -q "wifi-hotspot@"; then
+        systemctl restart wifi-hotspot@goutham.service
+        local ok=$?
+        if [ $ok -eq 0 ]; then
+            echo "[+] KLU Hotspot started successfully via systemd service."
+            send_notify "normal" "Hotspot Active" "KLU Hotspot is live!"
+            exit 0
+        fi
+    fi
 
     if systemctl is-active --quiet wifi-hotspot@*.service 2>/dev/null || pgrep -f "start_hotspot" >/dev/null; then
         echo "[!] Primary wifi-hotspot service is already active or starting on the system."

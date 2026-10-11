@@ -91,16 +91,11 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         this._isUpdating = false;
 
         let box = new St.BoxLayout({ style_class: 'panel-status-indicators-box' });
-        this._icon = new St.Icon({
-            icon_name: 'network-wireless-symbolic',
-            style_class: 'system-status-icon',
-        });
         this._label = new St.Label({
             text: 'KLU: OFF',
             y_align: Clutter.ActorAlign.CENTER,
-            style: 'font-weight: bold; margin-left: 4px; font-size: 11px;',
+            style: 'font-weight: bold; font-size: 11px; padding: 2px 6px; border-radius: 6px; color: #aaaaaa; background-color: rgba(0, 0, 0, 0.2);',
         });
-        box.add_child(this._icon);
         box.add_child(this._label);
         this.add_child(box);
         this.visible = true;
@@ -272,11 +267,11 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         this._isUpdating = false;
 
         let cmd = enable
-            ? ['pkexec', HOTSPOT_BIN, '--start']
-            : ['pkexec', HOTSPOT_BIN, '--stop'];
+            ? ['systemctl', 'start', 'wifi-hotspot@goutham.service']
+            : ['systemctl', 'stop', 'wifi-hotspot@goutham.service'];
 
         runCmd(cmd, () => {
-            GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
                 this._refreshState();
                 return GLib.SOURCE_REMOVE;
             });
@@ -310,12 +305,10 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
 
             if (wd) {
                 this._label.text = `KLU: ON (${band})`;
-                this._label.set_style('font-weight: bold; margin-left: 4px; font-size: 11px; color: inherit;');
-                this._icon.icon_name = 'network-wireless-signal-excellent-symbolic';
+                this._label.set_style('font-weight: bold; font-size: 11px; padding: 2px 6px; border-radius: 6px; color: #ffffff; background-color: rgba(255, 255, 255, 0.15);');
             } else {
                 this._label.text = 'KLU: OFF';
-                this._label.set_style('font-weight: bold; margin-left: 4px; font-size: 11px; color: inherit;');
-                this._icon.icon_name = 'network-wireless-offline-symbolic';
+                this._label.set_style('font-weight: bold; font-size: 11px; padding: 2px 6px; border-radius: 6px; color: #aaaaaa; background-color: rgba(0, 0, 0, 0.2);');
             }
 
             this._apStatusItem.label.text = `📡 AP: ${bssid} (Ch ${ch} | ${band})`;
@@ -476,28 +469,12 @@ class KLUSwitchQuickIndicator extends QuickSettings.SystemIndicator {
         super._init();
         this._extension = extension;
 
-        this._indicator = this._addIndicator();
-        this._indicator.icon_name = 'network-wireless-symbolic';
-        this._indicator.visible = false;
-
         this._toggle = new KLUSwitchQuickToggle(extension);
-        this._toggle._indicatorIcon = this._indicator;
-        this._toggle.bind_property(
-            'checked',
-            this._indicator,
-            'visible',
-            GObject.BindingFlags.SYNC_CREATE
-        );
-
         this.quickSettingsItems.push(this._toggle);
     }
 
     destroy() {
         this.quickSettingsItems = [];
-        if (this._indicator) {
-            this._indicator.destroy();
-            this._indicator = null;
-        }
         if (this._toggle) {
             this._toggle.destroy();
             this._toggle = null;
