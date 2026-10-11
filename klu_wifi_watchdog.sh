@@ -25,22 +25,22 @@ HIGH_SPEED_TARGET=50        # Target fast Tier-1 APs (>= 50 Mbps)
 SPEED_ROAM_COOLDOWN=60      # Minimum cooldown between speed-upgrade evaluations
 
 # Upgrade A & C: First-to-Connect Top-Tier Reclaim Configuration
-ENABLE_TOP_TIER_RECLAIM=0                  # 0 = Pure Stability (Leave decent connection alone; never interrupt). 1 = Reconnect to top AP when rebooted
-FAVORITE_TOP_TIER_AP="58:61:63:00:ab:17"   # Proven 165+ Mbps AP on Ch 116 (used during recovery if Wi-Fi fails)
-RECLAIM_CHECK_INTERVAL=15                  # Check every 15s if favorite 5GHz AP rebooted and is ready
+ENABLE_TOP_TIER_RECLAIM=1                  # 1 = Auto-reconnect to 165+ Mbps 5GHz AP when Hotspot is off
+FAVORITE_TOP_TIER_AP="58:61:63:00:ab:17"   # Proven 165+ Mbps AP on Ch 116
+RECLAIM_CHECK_INTERVAL=15                  # Check every 15s if favorite 5GHz AP is visible
 
-# Fast-Bailout & Blacklist Settings
-MAX_CANDIDATES=2              # Try at most the top 2 candidates (prevents 1-minute loop)
-BLACKLIST_DEFAULT=60          # 60s cooldown for ordinary APs (reduced from 5 minutes)
-BLACKLIST_TOP_TIER=25         # 25s (20-30s) quick retry for proven Top-Tier routers (>= 50 Mbps)
+# Candidate Queue & Bailout Settings
+MAX_CANDIDATES=2              # Try at most the top 2 candidates per cycle
 
 # Permanent Dead AP Blacklist (Known 0.0 Mbps / packet loss / association timeout traps from speed benchmarks)
 PERMANENT_DEAD_APS=(
     "58:61:63:fe:b6:7b"     # 0.0 Mbps (-84 dBm)
     "58:61:63:fe:a6:82"     # 0.0 - 0.6 Mbps (-85 dBm)
     "58:61:63:fe:9b:99"     # 0.0 - 1.4 Mbps (-78 dBm)
-    "06:7b:e9:22:20:4c"     # 0.0 Mbps (-79 dBm)
+    "06:7b:e9:22:20:4c"     # 0.0 - 0.4 Mbps dead trap (-79 dBm)
     "06:7b:e9:20:f8:c8"     # 0.0 - 4.3 Mbps trap (-71 dBm)
+    "06:7b:e9:22:44:2e"     # 0.0 Mbps (-78 dBm)
+    "58:61:63:fe:a9:2b"     # 1.1 - 2.2 Mbps trap (-81 dBm)
 )
 
 if [ -n "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -76,7 +76,7 @@ LAST_KEEPALIVE_TIME=0
 LAST_RECLAIM_CHECK_TIME=0
 KEEPALIVE_INTERVAL=15
 declare -a SWITCH_HISTORY=()
-declare -A BLACKLIST=()
+declare -A FAIL_PENALTY=()
 
 # Upgrade I: Signal Trend Guard — track last 3 readings for proactive roaming
 declare -a SIGNAL_HISTORY=()
@@ -717,8 +717,9 @@ check_signal_trend() {
 # Upgrade A: Targeted Top-Tier Beacon Watcher (First-in-Line Reclaim)
 # When the favorite 165+ Mbps AP ($FAVORITE_TOP_TIER_AP) finishes rebooting, claims Client Slot #1 immediately!
 check_top_tier_reclaim() {
-    # Pure Stability: Never interrupt or jump away from a decent, working connection
     [ "${ENABLE_TOP_TIER_RECLAIM:-0}" -ne 1 ] && return 0
+    # Do not reclaim if hotspot is currently active on single card (DFS safety)
+    is_hotspot_active && return 0
 
     local now
     now=$(date +%s)
@@ -946,28 +947,18 @@ adapt_hotspot_to_wifi() {
     send_notify "general" "normal" "Hotspot Switched to $new_band_label" "Hotspot restarted on Ch $cur_ch to match Wi-Fi band."
 }
 
-is_blacklisted() {
+is_permanent_dead() {
     local bssid="${1,,}"
-
-    # Permanent check: dead APs that cause packet loss or timeouts
     for dead in "${PERMANENT_DEAD_APS[@]}"; do
         if [ "$bssid" = "${dead,,}" ]; then
-            return 0  # Permanently blacklisted
+            return 0
         fi
     done
-
-    local expire="${BLACKLIST[$bssid]}"
-    if [ -n "$expire" ]; then
-        local now
-        now=$(date +%s)
-        if [ "$now" -lt "$expire" ]; then
-            return 0  # Still in temporary cooldown
-        else
-            unset 'BLACKLIST[$bssid]'  # Expired
-            return 1
-        fi
-    fi
     return 1
+}
+
+is_blacklisted() {
+    is_permanent_dead "$1"
 }
 
 is_top_tier_ap() {
@@ -1000,20 +991,20 @@ print(1 if found else 0)
     return 1
 }
 
-add_to_blacklist() {
+# Queue Logic: demotes failed AP to the back of the retry queue instead of 25s timeout blackout
+demote_candidate() {
     local bssid="${1,,}"
-    local now
-    now=$(date +%s)
-    local duration="$BLACKLIST_DEFAULT"
-    local tag="Standard AP"
+    local p="${FAIL_PENALTY[$bssid]:-0}"
+    FAIL_PENALTY["$bssid"]=$((p + 1))
+    echo -e "${YELLOW}>> [QUEUE ROTATION] Demoted $bssid to back of queue (Attempt #$((p + 1))).${RESET}"
+}
 
-    if is_top_tier_ap "$bssid"; then
-        duration="$BLACKLIST_TOP_TIER"
-        tag="Top-Tier Router (Fast Recovery)"
-    fi
+add_to_blacklist() {
+    demote_candidate "$1"
+}
 
-    BLACKLIST["$bssid"]=$((now + duration))
-    echo -e "${YELLOW}>> Blacklisted $bssid for ${duration}s [$tag] (failed internet check).${RESET}"
+reset_queue_penalties() {
+    FAIL_PENALTY=()
 }
 
 record_switch() {
@@ -1167,26 +1158,21 @@ show_status() {
 
     echo -e "${BOLD}Fail Streak  :${RESET} $fail_count / $FAIL_LIMIT"
 
-    # Display active cooldown blacklist if any
-    local bl_count=0
-    local bl_text=""
-    local now
-    now=$(date +%s)
-    for bl_bssid in "${!BLACKLIST[@]}"; do
-        local exp="${BLACKLIST[$bl_bssid]}"
-        if [ "$now" -lt "$exp" ]; then
-            local rem=$((exp - now))
-            ((bl_count++))
-            bl_text+="    • ${bl_bssid} (${rem}s remaining)\n"
-        else
-            unset 'BLACKLIST[$bl_bssid]'
+    # Display candidate queue demotions if any
+    local q_count=0
+    local q_text=""
+    for q_bssid in "${!FAIL_PENALTY[@]}"; do
+        local fails="${FAIL_PENALTY[$q_bssid]}"
+        if [ "$fails" -gt 0 ]; then
+            ((q_count++))
+            q_text+="    • ${q_bssid} (${fails} failed attempts | back of queue)\n"
         fi
     done
 
-    if [ "$bl_count" -gt 0 ]; then
+    if [ "$q_count" -gt 0 ]; then
         echo -e "${CYAN}----------------------------------------------------${RESET}"
-        echo -e "${BOLD}BLACKLISTED APs (Cooldown):${RESET}"
-        echo -en "$bl_text"
+        echo -e "${BOLD}CANDIDATE QUEUE (Demoted / Active Retry):${RESET}"
+        echo -en "$q_text"
     fi
 
     echo -e "${CYAN}----------------------------------------------------${RESET}"
@@ -1247,33 +1233,42 @@ find_candidates() {
                 # Never pick DFS channels (52-64, 100-144) to avoid crashing AP
                 if ((chan >= 52 && chan <= 64) || (chan >= 100 && chan <= 144))
                     next
-                # Option B: Candidate band is NOT locked! Wi-Fi picks best AP (2.4G or 5G),
-                # and Hotspot automatically adapts to whichever band Wi-Fi chooses.
             }
             if (signal >= min) {
-                # Upgrade 1: 5 GHz and 00: twin bonus (+15 score points)
-                # Prioritizes 80-120 Mbps 5GHz bands over crowded 2.4GHz bands
+                # Upgrade 2: 5 GHz and 00: twin bonus (+30 score points)
+                # Decisively prioritizes 100-170 Mbps 5GHz bands over crowded 2.4GHz bands
                 score = signal
                 if (chan > 14 || tolower(bssid) ~ /^58:61:63:00/) {
-                    score += 15
+                    score += 30
                 }
                 print score, signal, bssid
             }
-        }' |
-        sort -k1,1rn)
+        }')
 
-    local count=0
+    # Process candidates through Queue with Failure Demotion (No 25s timeout blackout)
+    local scored_list=()
     while read -r score signal bssid; do
         [ -z "$bssid" ] && continue
-        # Filter out blacklisted APs
-        if is_blacklisted "$bssid"; then
+        if is_permanent_dead "$bssid"; then
             continue
         fi
+        local penalty="${FAIL_PENALTY[${bssid,,}]:-0}"
+        local adj_score=$((score - (penalty * 20)))
+        scored_list+=("${adj_score}|${signal}|${bssid}")
+    done <<< "$raw_candidates"
+
+    [ "${#scored_list[@]}" -eq 0 ] && return 0
+
+    local sorted_queue
+    sorted_queue=$(printf '%s\n' "${scored_list[@]}" | sort -t'|' -k1,1rn)
+
+    local count=0
+    while IFS='|' read -r adj_score signal bssid; do
+        [ -z "$bssid" ] && continue
         echo "$signal $bssid"
         ((count++))
-        # Fast bailout: limit to top candidates
         [ "$count" -ge "$MAX_CANDIDATES" ] && break
-    done <<< "$raw_candidates"
+    done <<< "$sorted_queue"
 }
 
 switch_to_bssid() {
@@ -1317,6 +1312,7 @@ switch_to_bssid() {
             PREV_BSSID="${new_bssid:-$target}"
             SPEED_WINDOW=()
             adapt_hotspot_to_wifi "${new_bssid:-$target}"
+            reset_queue_penalties
             return 0
         fi
         sleep 0.2
@@ -1340,6 +1336,7 @@ switch_to_bssid() {
         PREV_BSSID="${new_bssid:-$target}"
         SPEED_WINDOW=()
         adapt_hotspot_to_wifi "${new_bssid:-$target}"
+        reset_queue_penalties
         return 0
     fi
 
@@ -1361,11 +1358,9 @@ recover_connection() {
     if [ -n "$initial_bssid" ]; then
         local twin
         twin=$(get_twin_bssid "$initial_bssid")
-        if [ -n "$twin" ] && ! is_blacklisted "$twin"; then
+        if [ -n "$twin" ] && ! is_permanent_dead "$twin"; then
             echo -e "${YELLOW}>> [TWIN SHIELD] AP dropped on $initial_bssid. Stepping instantly to twin AP ($twin)...${RESET}"
-            local now
-            now=$(date +%s)
-            BLACKLIST["${initial_bssid,,}"]=$((now + 30))
+            demote_candidate "$initial_bssid"
             if switch_to_bssid "$twin"; then
                 echo -e "${GREEN}>> Successfully protected connection on twin $twin!${RESET}"
                 return 0
