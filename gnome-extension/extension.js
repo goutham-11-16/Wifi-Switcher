@@ -171,6 +171,14 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
             runCmd(['nmcli', 'device', 'reapply', 'wlp0s20f3'], () => this._refreshState());
         });
         actionsSubMenu.menu.addMenuItem(reconnItem);
+
+        let turnOffAllItem = new PopupMenu.PopupMenuItem('🛑 Turn Off Watchdog & Hotspot');
+        turnOffAllItem.connect('activate', () => {
+            this.menu.close();
+            this._toggleWatchdog(false);
+            this._toggleHotspot(false);
+        });
+        actionsSubMenu.menu.addMenuItem(turnOffAllItem);
         this.menu.addMenuItem(actionsSubMenu);
 
         // Notification Settings Submenu
@@ -236,7 +244,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         if (enable) {
             cmd = ['systemctl', '--user', 'restart', 'klu-watchdog.service'];
         } else {
-            cmd = ['bash', '-c', 'systemctl --user stop klu-watchdog.service 2>/dev/null; pkill -9 -f klu_wifi_watchdog.sh 2>/dev/null; pkill -9 -f wifi-live-logs 2>/dev/null; nmcli connection modify KLU_WIFI 802-11-wireless.bssid "" 2>/dev/null || true'];
+            cmd = ['bash', '-c', 'systemctl --user stop klu-watchdog.service 2>/dev/null; rm -f /tmp/klu_watchdog.pid; pkill -9 -f klu_wifi_watchdog.sh 2>/dev/null; pkill -9 -f wifi-live-logs 2>/dev/null; nmcli connection modify KLU_WIFI 802-11-wireless.bssid "" 2>/dev/null || true'];
         }
 
         runCmd(cmd, () => {
@@ -270,7 +278,9 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
     _refreshState() {
         let script = `
         wd_active=0
-        if systemctl --user is-active --quiet klu-watchdog.service 2>/dev/null || pgrep -f "klu_wifi_watchdog.sh" >/dev/null 2>&1; then
+        if systemctl --user is-active --quiet klu-watchdog.service 2>/dev/null; then
+            wd_active=1
+        elif [ -f "/tmp/klu_watchdog.pid" ] && kill -0 "$(cat /tmp/klu_watchdog.pid 2>/dev/null)" 2>/dev/null; then
             wd_active=1
         fi
 
@@ -435,6 +445,17 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
         });
         this.menu.addMenuItem(unlockItem);
 
+        // Turn Off All item
+        let turnOffItem = new PopupMenu.PopupMenuItem('🛑 Turn Off Everything');
+        turnOffItem.connect('activate', () => {
+            this.menu.close();
+            if (this._extension && this._extension._topBarIndicator) {
+                this._extension._topBarIndicator._toggleWatchdog(false);
+                this._extension._topBarIndicator._toggleHotspot(false);
+            }
+        });
+        this.menu.addMenuItem(turnOffItem);
+
         this.connect('clicked', () => {
             if (this._extension && this._extension._topBarIndicator) {
                 this._extension._topBarIndicator._toggleWatchdog(this.checked);
@@ -503,6 +524,10 @@ export default class KLUSwitchExtension extends Extension {
     }
 
     disable() {
+        // Automatically stop watchdog service & scripts when extension is turned off
+        runCmd(['systemctl', '--user', 'stop', 'klu-watchdog.service']);
+        runCmd(['bash', '-c', 'rm -f /tmp/klu_watchdog.pid; pkill -9 -f klu_wifi_watchdog.sh 2>/dev/null; pkill -9 -f wifi-live-logs 2>/dev/null; nmcli connection modify KLU_WIFI 802-11-wireless.bssid "" 2>/dev/null || true']);
+
         if (this._topBarIndicator) {
             this._topBarIndicator.destroy();
             this._topBarIndicator = null;

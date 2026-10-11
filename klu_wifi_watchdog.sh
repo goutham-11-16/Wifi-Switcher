@@ -96,10 +96,11 @@ PORTAL_LOGIN_COOLDOWN=300         # Upgrade H: Re-login at most once per 5 minut
 
 # Safety Trap: Preserve active Wi-Fi connection with zero interruption on exit
 cleanup() {
+    rm -f "/tmp/klu_watchdog.pid"
     echo -e "\n${GREEN}Watchdog stopped. Active Wi-Fi connection preserved with zero interruption.${RESET}"
     exit 0
 }
-trap cleanup SIGINT SIGTERM
+trap cleanup SIGINT SIGTERM EXIT
 
 # Prioritize KLU_WIFI, enforce fast DNS, and optimize DHCP unicast re-binding (Upgrade B)
 nmcli connection modify "$CONNECTION" connection.autoconnect yes connection.autoconnect-priority 100 >/dev/null 2>&1
@@ -1434,6 +1435,7 @@ if [ "$1" = "--unlock" ]; then
     exit 0
 fi
 
+echo $$ > "/tmp/klu_watchdog.pid"
 clear
 echo "Starting KLU_WIFI watchdog & BSSID monitor..."
 echo "Interval: ${CHECK_INTERVAL}s | Fail Limit: ${FAIL_LIMIT} | Max APs Tested: ${MAX_CANDIDATES}"
