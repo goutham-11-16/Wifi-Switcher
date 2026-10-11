@@ -102,6 +102,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         box.add_child(this._icon);
         box.add_child(this._label);
         this.add_child(box);
+        this.visible = true;
 
         this._notifConfig = loadNotifConfig();
         this._buildMenu();
@@ -491,12 +492,30 @@ const KLUSwitchQuickIndicator = GObject.registerClass(
 class KLUSwitchQuickIndicator extends QuickSettings.SystemIndicator {
     _init(extension) {
         super._init();
+        this._extension = extension;
+
+        this._indicator = this._addIndicator();
+        this._indicator.icon_name = 'network-wireless-symbolic';
+        this._indicator.visible = false;
+
         this._toggle = new KLUSwitchQuickToggle(extension);
+        this._toggle._indicatorIcon = this._indicator;
+        this._toggle.bind_property(
+            'checked',
+            this._indicator,
+            'visible',
+            GObject.BindingFlags.SYNC_CREATE
+        );
+
         this.quickSettingsItems.push(this._toggle);
     }
 
     destroy() {
         this.quickSettingsItems = [];
+        if (this._indicator) {
+            this._indicator.destroy();
+            this._indicator = null;
+        }
         if (this._toggle) {
             this._toggle.destroy();
             this._toggle = null;
@@ -517,6 +536,7 @@ export default class KLUSwitchExtension extends Extension {
         }
         this._topBarIndicator = new KLUSwitchTopBarButton(this);
         Main.panel.addToStatusArea(role, this._topBarIndicator, 1, 'right');
+        this._topBarIndicator.visible = true;
 
         // 2. Add to Quick Settings Menu
         this._quickIndicator = new KLUSwitchQuickIndicator(this);
