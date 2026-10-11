@@ -13,6 +13,7 @@ const CONF_FILE = GLib.get_home_dir() + '/.config/klu-switch.conf';
 const LOGS_BIN = '/home/goutham/.local/bin/wifi-live-logs';
 const WATCHDOG_SCRIPT = '/home/goutham/Personal Files/WIfi test/KLU WIFI SWIFT/klu_wifi_watchdog.sh';
 const HOTSPOT_BIN = '/home/goutham/.local/bin/klu-hotspot';
+const STATUS_SCRIPT = '/home/goutham/Personal Files/WIfi test/KLU WIFI SWIFT/scripts/klu_status.sh';
 
 function runCmd(args, callback = null) {
     try {
@@ -238,6 +239,12 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         if (this._extension && this._extension._quickIndicator && this._extension._quickIndicator._toggle) {
             this._extension._quickIndicator._toggle.checked = enable;
             this._extension._quickIndicator._toggle._qsWatchdogSwitch.setToggleState(enable);
+            this._extension._quickIndicator._toggle.iconName = enable
+                ? 'network-wireless-signal-excellent-symbolic'
+                : 'network-wireless-offline-symbolic';
+            this._extension._quickIndicator._toggle.subtitle = enable
+                ? 'Watchdog ON...'
+                : 'Watchdog & Hotspot OFF';
         }
         this._isUpdating = false;
 
@@ -249,7 +256,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         }
 
         runCmd(cmd, () => {
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 600, () => {
                 this._refreshState();
                 return GLib.SOURCE_REMOVE;
             });
@@ -277,36 +284,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
     }
 
     _refreshState() {
-        let script = `
-        wd_active=0
-        if systemctl --user is-active --quiet klu-watchdog.service 2>/dev/null; then
-            wd_active=1
-        elif [ -f "/tmp/klu_watchdog.pid" ] && kill -0 "$(cat /tmp/klu_watchdog.pid 2>/dev/null)" 2>/dev/null; then
-            wd_active=1
-        fi
-
-        hs_active=0
-        if [ -f "/tmp/klu_hotspot.state" ] && [ -f "/tmp/klu_hotspot.pid" ] && kill -0 "$(cat /tmp/klu_hotspot.pid 2>/dev/null)" 2>/dev/null; then
-            hs_active=1
-        fi
-
-        link=$(iw dev wlp0s20f3 link 2>/dev/null)
-        bssid=$(echo "$link" | awk '/Connected to/{print $3}')
-        sig=$(echo "$link" | awk '/signal:/{print $2}')
-        ch=$(iw dev wlp0s20f3 info 2>/dev/null | awk '/channel/{print $2}')
-        band="2.4GHz"
-        [ -n "$ch" ] && [ "$ch" -gt 14 ] && band="5GHz"
-
-        hs_ch=$(iw dev ap0 info 2>/dev/null | awk '/channel/{print $2}')
-        hs_clients=$(iw dev ap0 station dump 2>/dev/null | awk '/Station/{c++} END{print c+0}')
-
-        speed=$(tail -n 1 "/home/goutham/Personal Files/WIfi test/KLU WIFI SWIFT/klu_wifi_speeds.log" 2>/dev/null | grep -o 'Speed: [^ ]* Mbps' || echo "")
-        gw=$(ip route show dev wlp0s20f3 2>/dev/null | awk '/default/{print $3}' | head -n 1)
-
-        echo "$wd_active|$hs_active|$bssid|$sig|$ch|$band|$hs_ch|$hs_clients|$speed|$gw"
-        `;
-
-        runCmd(['bash', '-c', script], (ok, stdout) => {
+        runCmd(['bash', STATUS_SCRIPT], (ok, stdout) => {
             if (this._destroyed || !this._watchdogSwitch) return;
             if (!ok || !stdout) return;
             let p = stdout.trim().split('|');
@@ -384,10 +362,11 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
     _init(extension) {
         super._init({
             title: 'KLU Switch',
-            subtitle: 'Watchdog & Hotspot',
-            iconName: 'network-wireless-signal-excellent-symbolic',
+            subtitle: 'Watchdog & Hotspot OFF',
+            iconName: 'network-wireless-offline-symbolic',
             toggleMode: true,
         });
+        this.checked = false;
         this._extension = extension;
 
         this.menu.setHeader('network-wireless-signal-excellent-symbolic', 'KLU Switch', 'Watchdog & Hotspot Control');
@@ -471,6 +450,9 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
         this._qsWatchdogSwitch.setToggleState(wd);
         this._qsHotspotSwitch.setToggleState(hs);
         this._isUpdating = false;
+
+        this.iconName = wd ? 'network-wireless-signal-excellent-symbolic' : 'network-wireless-offline-symbolic';
+
         if (wd && hs) {
             this.subtitle = `Watchdog ON (${band}) | Hotspot ACTIVE`;
         } else if (wd) {
@@ -541,6 +523,9 @@ export default class KLUSwitchExtension extends Extension {
         // 2. Add to Quick Settings Menu
         this._quickIndicator = new KLUSwitchQuickIndicator(this);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._quickIndicator);
+
+        // 3. Immediate state sync
+        this._topBarIndicator._refreshState();
     }
 
     disable() {
