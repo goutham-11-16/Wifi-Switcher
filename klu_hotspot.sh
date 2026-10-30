@@ -183,7 +183,8 @@ cmd_start() {
                 b=$1":"$2":"$3":"$4":"$5":"$6; c=$8; s=$9;
                 if ((c >= 52 && c <= 64) || (c >= 100 && c <= 144)) next;
                 score = s;
-                if (c >= 36) score += 15;
+                if ((c >= 36 && c <= 48) || (c >= 149 && c <= 165)) score += 40;
+                else if (c >= 36) score += 15;
                 if (score > max) { max = score; best = b; }
             } END { print best }
         ')

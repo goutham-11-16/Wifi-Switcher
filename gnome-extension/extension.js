@@ -38,7 +38,7 @@ function runCmd(args, callback = null) {
 }
 
 function loadNotifConfig() {
-    let conf = { master: true, speed: true, roam: true };
+    let conf = { master: true, speed: true, roam: true, nonDfs: false };
     if (GLib.file_test(CONF_FILE, GLib.FileTest.EXISTS)) {
         try {
             let [ok, bytes] = GLib.file_get_contents(CONF_FILE);
@@ -48,6 +48,7 @@ function loadNotifConfig() {
                     if (line.includes('NOTIFICATIONS_ENABLED=')) conf.master = !line.includes('false');
                     if (line.includes('NOTIFY_SPEED=')) conf.speed = !line.includes('false');
                     if (line.includes('NOTIFY_ROAM=')) conf.roam = !line.includes('false');
+                    if (line.includes('NON_DFS_MODE=')) conf.nonDfs = line.includes('true');
                 }
             }
         } catch (e) {}
@@ -58,7 +59,8 @@ function loadNotifConfig() {
 function saveNotifConfig(conf) {
     let text = `NOTIFICATIONS_ENABLED="${conf.master}"\n` +
                `NOTIFY_SPEED="${conf.speed}"\n` +
-               `NOTIFY_ROAM="${conf.roam}"\n`;
+               `NOTIFY_ROAM="${conf.roam}"\n` +
+               `NON_DFS_MODE="${conf.nonDfs}"\n`;
     try {
         GLib.file_set_contents(CONF_FILE, text);
     } catch (e) {}
@@ -129,7 +131,24 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         });
         this.menu.addMenuItem(this._hotspotSwitch);
 
+        // Non-DFS AP (Stable) Switch
+        this._nonDfsSwitch = new PopupMenu.PopupSwitchMenuItem('🛡️ Non-DFS AP (Stable)', this._notifConfig.nonDfs);
+        this._nonDfsSwitch.connect('toggled', (item, state) => {
+            if (this._isUpdating) return;
+            this._toggleNonDfs(state);
+        });
+        this.menu.addMenuItem(this._nonDfsSwitch);
+
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        // Swift Switch Button (Instant switch of BSSID)
+        let swiftItem = new PopupMenu.PopupMenuItem('⚡ Swift (Switch BSSID Now)');
+        swiftItem.label.set_style('font-weight: bold; color: #f6d32d;');
+        swiftItem.connect('activate', () => {
+            this.menu.close();
+            runCmd(['bash', WATCHDOG_SCRIPT, '--swift'], () => this._refreshState());
+        });
+        this.menu.addMenuItem(swiftItem);
 
         // Live Terminal Button
         let termItem = new PopupMenu.PopupMenuItem('📜 Watch Live Terminal');
@@ -223,6 +242,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
                 this._notifMasterSwitch.setToggleState(this._notifConfig.master);
                 this._notifSpeedSwitch.setToggleState(this._notifConfig.speed);
                 this._notifRoamSwitch.setToggleState(this._notifConfig.roam);
+                this._nonDfsSwitch.setToggleState(this._notifConfig.nonDfs);
                 this._refreshState();
             }
         });
@@ -278,7 +298,31 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         });
     }
 
+    _toggleNonDfs(enable) {
+        this._notifConfig.nonDfs = enable;
+        saveNotifConfig(this._notifConfig);
+        this._isUpdating = true;
+        this._nonDfsSwitch.setToggleState(enable);
+        if (this._extension && this._extension._quickIndicator && this._extension._quickIndicator._toggle) {
+            let qsSwitch = this._extension._quickIndicator._toggle._qsNonDfsSwitch;
+            if (qsSwitch) qsSwitch.setToggleState(enable);
+        }
+        this._isUpdating = false;
+
+        let cmd = ['bash', WATCHDOG_SCRIPT, enable ? '--non-dfs-on' : '--non-dfs-off'];
+        runCmd(cmd, () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+                this._refreshState();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+
     _refreshState() {
+        let conf = loadNotifConfig();
+        if (this._nonDfsSwitch) {
+            this._nonDfsSwitch.setToggleState(conf.nonDfs);
+        }
         runCmd(['bash', STATUS_SCRIPT], (ok, stdout) => {
             if (this._destroyed || !this._watchdogSwitch) return;
             if (!ok || !stdout) return;
@@ -384,7 +428,27 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
         });
         this.menu.addMenuItem(this._qsHotspotSwitch);
 
+        // Non-DFS AP (Stable) Switch
+        let initialNonDfs = loadNotifConfig().nonDfs;
+        this._qsNonDfsSwitch = new PopupMenu.PopupSwitchMenuItem('🛡️ Non-DFS AP (Stable)', initialNonDfs);
+        this._qsNonDfsSwitch.connect('toggled', (item, state) => {
+            if (this._isUpdating) return;
+            if (this._extension && this._extension._topBarIndicator) {
+                this._extension._topBarIndicator._toggleNonDfs(state);
+            }
+        });
+        this.menu.addMenuItem(this._qsNonDfsSwitch);
+
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        // Swift Switch Button (Instant switch of BSSID)
+        let qsSwiftItem = new PopupMenu.PopupMenuItem('⚡ Swift (Switch BSSID Now)');
+        qsSwiftItem.label.set_style('font-weight: bold; color: #f6d32d;');
+        qsSwiftItem.connect('activate', () => {
+            this.menu.close();
+            runCmd(['bash', WATCHDOG_SCRIPT, '--swift']);
+        });
+        this.menu.addMenuItem(qsSwiftItem);
 
         // Terminal item
         let termItem = new PopupMenu.PopupMenuItem('📜 Watch Live Terminal');
@@ -442,6 +506,10 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
         this.checked = wd;
         this._qsWatchdogSwitch.setToggleState(wd);
         this._qsHotspotSwitch.setToggleState(hs);
+        let conf = loadNotifConfig();
+        if (this._qsNonDfsSwitch) {
+            this._qsNonDfsSwitch.setToggleState(conf.nonDfs);
+        }
         this._isUpdating = false;
 
         this.iconName = wd ? 'network-wireless-signal-excellent-symbolic' : 'network-wireless-offline-symbolic';

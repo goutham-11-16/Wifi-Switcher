@@ -24,23 +24,37 @@ MIN_ACCEPTABLE_SPEED=5.0    # Switch to another network if throughput is < 5.0 M
 HIGH_SPEED_TARGET=50        # Target fast Tier-1 APs (>= 50 Mbps)
 SPEED_ROAM_COOLDOWN=60      # Minimum cooldown between speed-upgrade evaluations
 
-# Upgrade A & C: First-to-Connect Top-Tier Reclaim Configuration
+# Non-DFS Stability Mode: avoids radar channels (Ch 52-64, 100-144) to guarantee zero radar evictions
+NON_DFS_MODE=0
+CONF_FILE="$HOME/.config/klu-switch.conf"
+if [ -f "$CONF_FILE" ]; then
+    if grep -q 'NON_DFS_MODE="true"' "$CONF_FILE" 2>/dev/null; then
+        NON_DFS_MODE=1
+    fi
+fi
+
+# Upgrade A & C: First-to-Connect Dual Top-Tier Reclaim Configuration
 ENABLE_TOP_TIER_RECLAIM=1                  # 1 = Auto-reconnect to 165+ Mbps 5GHz AP when Hotspot is off
-FAVORITE_TOP_TIER_AP="58:61:63:00:ab:17"   # Proven 165+ Mbps AP on Ch 116
-RECLAIM_CHECK_INTERVAL=15                  # Check every 15s if favorite 5GHz AP is visible
+TOP_TIER_APS=(
+    "58:61:63:00:ab:17"                    # Proven 191+ Mbps AP on Ch 116/132
+    "58:61:63:00:88:a3"                    # Proven 155+ Mbps AP on Ch 116
+)
+FAVORITE_TOP_TIER_AP="58:61:63:00:ab:17"   # Primary favorite
+RECLAIM_CHECK_INTERVAL=60                  # Check every 60s if top-tier 5GHz AP is visible
 
 # Candidate Queue & Bailout Settings
 MAX_CANDIDATES=2              # Try at most the top 2 candidates per cycle
 
 # Permanent Dead AP Blacklist (Known 0.0 Mbps / packet loss / association timeout traps from speed benchmarks)
 PERMANENT_DEAD_APS=(
-    "58:61:63:fe:b6:7b"     # 0.0 Mbps (-84 dBm)
-    "58:61:63:fe:a6:82"     # 0.0 - 0.6 Mbps (-85 dBm)
-    "58:61:63:fe:9b:99"     # 0.0 - 1.4 Mbps (-78 dBm)
+    "58:61:63:fe:b6:7b"     # 0.0 Mbps (-84 dBm) - 100% DEAD TRAP
+    "58:61:63:fe:a6:82"     # 0.0 - 0.6 Mbps (-85 dBm) - DEAD TRAP
+    "58:61:63:fe:9b:99"     # 0.0 - 1.4 Mbps (-78 dBm) - DEAD TRAP
     "06:7b:e9:22:20:4c"     # 0.0 - 0.4 Mbps dead trap (-79 dBm)
     "06:7b:e9:20:f8:c8"     # 0.0 - 4.3 Mbps trap (-71 dBm)
     "06:7b:e9:22:44:2e"     # 0.0 Mbps (-78 dBm)
     "58:61:63:fe:a9:2b"     # 1.1 - 2.2 Mbps trap (-81 dBm)
+    "00:1a:8c:f2:43:f6"     # 4.9 Mbps trap (-75 dBm)
 )
 
 if [ -n "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -91,8 +105,9 @@ SPEED_TEST_RUNNING=0
 declare -a SPEED_WINDOW=()        # Circular buffer of last 3 speed results
 SPEED_WINDOW_SIZE=3               # Must have 3 samples before triggering roam decision
 STABLE_SPEED_THRESHOLD=40         # If avg of last 3 tests >= 40 Mbps, AP is "stable" — do NOT roam away
+CACHED_PORTAL_USER="admission"
 LAST_PORTAL_LOGIN_TIME=0
-PORTAL_LOGIN_COOLDOWN=300         # Upgrade H: Re-login at most once per 5 minutes
+PORTAL_LOGIN_COOLDOWN=30          # Upgrade H: Re-login retry interval (30s)
 
 # Safety Trap: Preserve active Wi-Fi connection with zero interruption on exit
 cleanup() {
@@ -203,6 +218,10 @@ gateway_ok() {
 
 # Ultra-Fast Captive Portal Check (20-30ms response time)
 portal_reachable() {
+    # Check dynamic gateway first
+    if gateway_ok; then
+        return 0
+    fi
     local pcode
     pcode=$(curl -4 -s -m 0.5 --connect-timeout 0.4 -o /dev/null -w "%{http_code}" --interface "$INTERFACE" "$PORTAL_URL" 2>/dev/null)
     if [ "$pcode" = "200" ] || [ "$pcode" = "302" ]; then
@@ -247,13 +266,13 @@ get_twin_bssid() {
     fi
 }
 
-# Keep-Alive & Upgrade D: Keeps Cyberoam NAT session & campus gateway ARP table active
+# Keep-Alive & Upgrade D: Keeps Cyberoam/Sophos NAT session & campus gateway ARP table active
 keep_alive_portal() {
     local now
     now=$(date +%s)
     if [ $((now - LAST_KEEPALIVE_TIME)) -ge "$KEEPALIVE_INTERVAL" ]; then
         LAST_KEEPALIVE_TIME="$now"
-        # Upgrade D: Gateway ARP Keep-Warm (refreshes router CAM/ARP hardware table entry)
+        # Upgrade D: Gateway ARP Keep-Warm (refreshes router CAM & ARP hardware table entries)
         local gw
         gw=$(get_gateway)
         if [ -n "$gw" ]; then
@@ -264,39 +283,73 @@ keep_alive_portal() {
             fi
         fi
 
-        # Upgrade G: Firewall Session Keep-alive — resets Sophos/Cyberoam idle TCP timer
-        # Without this, after ~4 min idle the firewall silently expires your session
-        curl -4 -s -m 2 -o /dev/null --interface "$INTERFACE" "$PORTAL_URL" 2>/dev/null &
-        curl -4 -s -m 2 -o /dev/null --interface "$INTERFACE" "http://connectivitycheck.gstatic.com/generate_204" 2>/dev/null &
+        # Upgrade G: Cyberoam / Sophos Captive Portal Live Heartbeat
+        # In background: queries status, extracts logged-in user, and sends mode=192 live heartbeat
+        (
+            local status_xml user status
+            status_xml=$(curl -4 -s -m 2 --interface "$INTERFACE" "http://${PORTAL_IP}:8090/captiveportal/status" 2>/dev/null)
+            if [ -n "$status_xml" ]; then
+                user=$(echo "$status_xml" | grep -oP '(?<=<user><!\[CDATA\[).*?(?=\]\]></user>)')
+                status=$(echo "$status_xml" | grep -oP '(?<=<status><!\[CDATA\[).*?(?=\]\]></status>)')
+                [ -n "$user" ] && CACHED_PORTAL_USER="$user"
+
+                local active_user="${user:-${CACHED_PORTAL_USER:-admission}}"
+                curl -4 -s -m 2 -o /dev/null --interface "$INTERFACE" \
+                    "http://${PORTAL_IP}:8090/live?mode=192&username=${active_user}&producttype=0&a=$(date +%s%3N)" 2>/dev/null
+            fi
+            # Keep persistent HTTP client tab active
+            curl -4 -s -m 2 -o /dev/null --interface "$INTERFACE" "$PORTAL_URL" 2>/dev/null
+            # Keep external firewall NAT translations warm
+            curl -4 -s -m 2 -o /dev/null --interface "$INTERFACE" "http://connectivitycheck.gstatic.com/generate_204" 2>/dev/null
+        ) &
     fi
 }
 
-# Upgrade H: Auto Portal Re-login — submits saved credentials when session expires
-# Detects the redirect pattern: internet_ok fails but portal is reachable (= firewall wall)
+# Upgrade H: Auto Portal Re-login — submits saved credentials or revives session when expired
 auto_login_portal() {
     local now
     now=$(date +%s)
-    [ $((now - LAST_PORTAL_LOGIN_TIME)) -lt "$PORTAL_LOGIN_COOLDOWN" ] && return 0
+    [ $((now - LAST_PORTAL_LOGIN_TIME)) -lt "$PORTAL_LOGIN_COOLDOWN" ] && return 1
+
+    # Read credentials if configured in ~/.config/klu-switch.conf
+    local p_user="" p_pass=""
+    if [ -f "$HOME/.config/klu-switch.conf" ]; then
+        p_user=$(grep '^PORTAL_USER=' "$HOME/.config/klu-switch.conf" | head -n1 | cut -d'"' -f2)
+        p_pass=$(grep '^PORTAL_PASSWORD=' "$HOME/.config/klu-switch.conf" | head -n1 | cut -d'"' -f2)
+    fi
+    [ -z "$p_user" ] && p_user="${CACHED_PORTAL_USER:-admission}"
 
     # Only attempt if portal is up but internet is blocked (= session expired, needs re-login)
     if portal_reachable && ! internet_ok; then
-        echo -e "${YELLOW}>> [AUTO-LOGIN] Portal reachable but internet blocked. Session may have expired. Attempting re-login...${RESET}"
-        # Submit login form using curl POST (Sophos/Cyberoam httpclient format)
-        local login_result
-        login_result=$(curl -4 -s -k -m 5 -o /dev/null -w "%{http_code}" \
-            --interface "$INTERFACE" \
-            -X POST "$PORTAL_URL" \
-            -d 'mode=191&username=&password=&a=1&producttype=0' \
-            2>/dev/null)
+        echo -e "${YELLOW}>> [AUTO-LOGIN] Portal reachable but internet blocked. Attempting session restore for '$p_user'...${RESET}"
         LAST_PORTAL_LOGIN_TIME="$now"
+
+        # 1. Try sending live heartbeat first (in case session is paused)
+        curl -4 -s -m 2 -o /dev/null --interface "$INTERFACE" \
+            "http://${PORTAL_IP}:8090/live?mode=192&username=${p_user}&producttype=0&a=$(date +%s%3N)" 2>/dev/null
+        sleep 0.5
         if internet_ok; then
-            echo -e "${GREEN}>> [AUTO-LOGIN] Re-login succeeded! Internet restored.${RESET}"
-            local timestamp
-            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-            echo "[$timestamp] AUTO_LOGIN: Portal session refreshed successfully." >> "$LOG_FILE"
+            echo -e "${GREEN}>> [AUTO-LOGIN] Session revived via heartbeat! Internet restored.${RESET}"
             return 0
-        else
-            echo -e "${CYAN}>> [AUTO-LOGIN] Re-login attempted (HTTP $login_result). Will retry if needed.${RESET}"
+        fi
+
+        # 2. If credentials are provided in ~/.config/klu-switch.conf, submit login form
+        if [ -n "$p_pass" ]; then
+            local login_result
+            login_result=$(curl -4 -s -k -m 5 -o /dev/null -w "%{http_code}" \
+                --interface "$INTERFACE" \
+                -X POST "$PORTAL_URL" \
+                -d "mode=191&username=${p_user}&password=${p_pass}&a=1&producttype=0" \
+                2>/dev/null)
+            if internet_ok; then
+                echo -e "${GREEN}>> [AUTO-LOGIN] Re-login succeeded! Internet restored.${RESET}"
+                local timestamp
+                timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                echo "[$timestamp] AUTO_LOGIN: Portal session refreshed successfully." >> "$LOG_FILE"
+                return 0
+            else
+                echo -e "${CYAN}>> [AUTO-LOGIN] Re-login attempted (HTTP $login_result).${RESET}"
+            fi
         fi
     fi
     return 1
@@ -715,34 +768,67 @@ check_signal_trend() {
 }
 
 # Upgrade A: Targeted Top-Tier Beacon Watcher (First-in-Line Reclaim)
-# When the favorite 165+ Mbps AP ($FAVORITE_TOP_TIER_AP) finishes rebooting, claims Client Slot #1 immediately!
+# Only reclaims if current internet is NOT stable/healthy, and favorite APs have not failed
 check_top_tier_reclaim() {
     [ "${ENABLE_TOP_TIER_RECLAIM:-0}" -ne 1 ] && return 0
-    # Do not reclaim if hotspot is currently active on single card (DFS safety)
-    is_hotspot_active && return 0
+    # Do not reclaim if hotspot is currently active on single card (DFS safety) or Non-DFS mode is enabled
+    if is_hotspot_active || [ "$NON_DFS_MODE" -eq 1 ]; then
+        return 0
+    fi
 
     local now
     now=$(date +%s)
-    [ $((now - LAST_RECLAIM_CHECK_TIME)) -lt "$RECLAIM_CHECK_INTERVAL" ] && return 0
+    [ $((now - LAST_RECLAIM_CHECK_TIME)) -lt "${RECLAIM_CHECK_INTERVAL:-60}" ] && return 0
     LAST_RECLAIM_CHECK_TIME="$now"
 
     local cur_bssid
     cur_bssid=$(get_current_bssid)
     [ -z "$cur_bssid" ] && return 0
-    # Only reclaim if we are currently NOT on the favorite top-tier AP
-    [ "${cur_bssid,,}" = "${FAVORITE_TOP_TIER_AP,,}" ] && return 0
 
-    # Fast targeted check: see if FAVORITE_TOP_TIER_AP has booted back up and is visible
-    local visible_sig
-    visible_sig=$(nmcli -t -f BSSID,SIGNAL device wifi list ifname "$INTERFACE" 2>/dev/null | sed 's/\\//g' | awk -F: -v target="${FAVORITE_TOP_TIER_AP,,}" '
-        tolower($1 ":" $2 ":" $3 ":" $4 ":" $5 ":" $6) == target { print $7; exit }
-    ')
+    # Only reclaim if we are currently NOT on ANY of the top-tier APs
+    for top_ap in "${TOP_TIER_APS[@]}"; do
+        if [ "${cur_bssid,,}" = "${top_ap,,}" ]; then
+            return 0  # Already on a recognized top-tier AP
+        fi
+    done
 
-    if [ -n "$visible_sig" ] && [ "$visible_sig" -ge "$MIN_SIGNAL" ] 2>/dev/null; then
+    # STABILITY GUARD: Never interrupt if current connection has working internet and good speed!
+    if internet_ok; then
+        local avg_speed
+        avg_speed=$(get_rolling_avg_speed)
+        local is_stable
+        is_stable=$(awk -v avg="$avg_speed" -v threshold="$STABLE_SPEED_THRESHOLD" 'BEGIN {
+            print (avg >= threshold) ? 1 : 0
+        }')
+        if [ "$is_stable" -eq 1 ]; then
+            return 0  # Current connection is stable and fast — do NOT disconnect!
+        fi
+    fi
+
+    # Fast targeted check: find the strongest visible top-tier AP
+    local best_target=""
+    local best_sig=-1
+    for top_ap in "${TOP_TIER_APS[@]}"; do
+        local cur_p="${FAIL_PENALTY[${top_ap,,}]:-0}"
+        [ "$cur_p" -gt 0 ] && continue  # Skip AP if it recently failed
+
+        local sig
+        sig=$(nmcli -t -f BSSID,SIGNAL device wifi list ifname "$INTERFACE" 2>/dev/null | sed 's/\\//g' | awk -F: -v target="${top_ap,,}" '
+            tolower($1 ":" $2 ":" $3 ":" $4 ":" $5 ":" $6) == target { print $7; exit }
+        ')
+        if [ -n "$sig" ] && [ "$sig" -ge "$MIN_SIGNAL" ] 2>/dev/null; then
+            if [ "$sig" -gt "$best_sig" ]; then
+                best_sig="$sig"
+                best_target="$top_ap"
+            fi
+        fi
+    done
+
+    if [ -n "$best_target" ]; then
         echo
-        echo -e "${GREEN}>> [FIRST-TO-CONNECT] Top-Tier 5GHz AP ($FAVORITE_TOP_TIER_AP) is back online (${visible_sig}% signal)!${RESET}"
-        echo -e "${CYAN}>> Claiming Client Slot #1 before other devices notice reboot...${RESET}"
-        switch_to_bssid "$FAVORITE_TOP_TIER_AP"
+        echo -e "${GREEN}>> [FIRST-TO-CONNECT] Top-Tier 5GHz AP ($best_target) is visible (${best_sig}% signal)!${RESET}"
+        echo -e "${CYAN}>> Claiming Client Slot #1 (current speed below threshold)...${RESET}"
+        switch_to_bssid "$best_target"
     fi
 }
 
@@ -841,7 +927,10 @@ chan_to_freq() {
 }
 
 is_hotspot_active() {
-    ip link show ap0 >/dev/null 2>&1 || [ -f "/tmp/klu_hotspot.state" ]
+    systemctl is-active --quiet wifi-hotspot@*.service 2>/dev/null || \
+    ip link show ap0 >/dev/null 2>&1 || \
+    [ -f "/tmp/klu_hotspot.state" ] || \
+    [ -f "/tmp/wifi-hotspot-active-mode" ]
 }
 
 
@@ -893,7 +982,7 @@ sync_hotspot_channel() {
     fi
 }
 
-# Adapts Hotspot to match Wi-Fi band & channel (Option B: Hotspot follows Wi-Fi)
+# Adapts Hotspot to match Wi-Fi band & channel (Hotspot seamlessly follows Wi-Fi)
 adapt_hotspot_to_wifi() {
     local target_bssid="$1"
     if ! is_hotspot_active; then
@@ -911,40 +1000,26 @@ adapt_hotspot_to_wifi() {
 
     local ap_ch
     ap_ch=$(get_hotspot_channel)
-    [ -z "$ap_ch" ] && return 0
 
-    local is_cur_5g=0; [ "$cur_ch" -gt 14 ] && is_cur_5g=1
-    local is_ap_5g=0;  [ "$ap_ch" -gt 14 ] && is_ap_5g=1
+    # If channels differ or ap0 is not yet up on current channel, restart hotspot to follow Wi-Fi
+    if [ "$cur_ch" != "$ap_ch" ]; then
+        local band_label="2.4GHz"
+        [ "$cur_ch" -gt 14 ] && band_label="5GHz"
 
-    # Case 1: Same band -> seamless Channel Switch Announcement (CSA) without disconnect
-    if [ "$is_cur_5g" -eq "$is_ap_5g" ]; then
-        if [ "$cur_ch" != "$ap_ch" ]; then
-            sync_hotspot_channel "$target_bssid"
+        echo -e "${YELLOW}>> Hotspot Sync: Channel change detected (${ap_ch:-None} -> $cur_ch [${band_label}]).${RESET}"
+        echo -e "${YELLOW}>> Restarting Hotspot to follow Wi-Fi radio (clients will reconnect in ~2s)...${RESET}"
+
+        if systemctl list-unit-files 2>/dev/null | grep -q "wifi-hotspot@"; then
+            systemctl restart wifi-hotspot@goutham.service >/dev/null 2>&1 &
+        else
+            local klu_hs_script="${SCRIPT_DIR}/klu_hotspot.sh"
+            if [ -x "$klu_hs_script" ]; then
+                "$klu_hs_script" --restart >/dev/null 2>&1 &
+            fi
         fi
-        return 0
+
+        send_notify "general" "normal" "Hotspot Following Wi-Fi" "Hotspot restarting on Ch $cur_ch (${band_label}) to match Wi-Fi."
     fi
-
-    # Case 2: Cross-band switch (2.4GHz <-> 5GHz) -> Option B band adapt & restart
-    local new_band_label="2.4GHz"
-    local conf_band="bg"
-    if [ "$is_cur_5g" -eq 1 ]; then
-        new_band_label="5GHz"
-        conf_band="a"
-    fi
-
-    echo -e "${YELLOW}>> Hotspot Sync: Cross-band jump detected ($([ "$is_ap_5g" -eq 1 ] && echo "5G" || echo "2.4G") -> ${new_band_label} on Ch $cur_ch).${RESET}"
-    echo -e "${YELLOW}>> Restarting Hotspot to match Wi-Fi band (clients will reconnect in ~3s)...${RESET}"
-
-    if systemctl is-active --quiet wifi-hotspot@*.service 2>/dev/null; then
-        systemctl restart wifi-hotspot@goutham.service >/dev/null 2>&1 &
-    else
-        local klu_hs_script="${SCRIPT_DIR}/klu_hotspot.sh"
-        if [ -x "$klu_hs_script" ] && [ -f "/tmp/klu_hotspot.state" ]; then
-            "$klu_hs_script" --restart >/dev/null 2>&1 &
-        fi
-    fi
-
-    send_notify "general" "normal" "Hotspot Switched to $new_band_label" "Hotspot restarted on Ch $cur_ch to match Wi-Fi band."
 }
 
 is_permanent_dead() {
@@ -1004,7 +1079,12 @@ add_to_blacklist() {
 }
 
 reset_queue_penalties() {
-    FAIL_PENALTY=()
+    local target="${1,,}"
+    if [ -n "$target" ]; then
+        unset "FAIL_PENALTY[$target]"
+    else
+        FAIL_PENALTY=()
+    fi
 }
 
 record_switch() {
@@ -1091,10 +1171,8 @@ show_status() {
             local is_cur_5g=0; [ "$cur_ch" -gt 14 ] && is_cur_5g=1
             local is_ap_5g=0;  [ "$ap_ch" -gt 14 ] && is_ap_5g=1
 
-            if [ "$is_cur_5g" -ne "$is_ap_5g" ]; then
+            if [ "$ap_ch" != "$cur_ch" ]; then
                 adapt_hotspot_to_wifi "$bssid"
-            elif [ "$ap_ch" != "$cur_ch" ]; then
-                sync_hotspot_channel "$bssid"
             fi
         fi
     fi
@@ -1220,26 +1298,33 @@ find_candidates() {
         hs_on=1
     fi
 
+    # Check live non-dfs flag from config file
+    local non_dfs=0
+    if [ -f "$CONF_FILE" ] && grep -q 'NON_DFS_MODE="true"' "$CONF_FILE" 2>/dev/null; then
+        non_dfs=1
+    fi
+
     local raw_candidates
     raw_candidates=$(nmcli -t -f BSSID,SSID,CHAN,SIGNAL device wifi list ifname "$INTERFACE" 2>/dev/null |
         sed 's/\\//g' |
-        awk -F: -v target="$TARGET_SSID" -v min="$MIN_SIGNAL" -v hs="$hs_on" '
+        awk -F: -v target="$TARGET_SSID" -v min="$MIN_SIGNAL" -v hs="$hs_on" -v ndfs="$non_dfs" '
         $7 == target {
             bssid=$1 ":" $2 ":" $3 ":" $4 ":" $5 ":" $6
             chan=$8
             signal=$9
-            # When hotspot is active on single card:
-            if (hs == 1) {
-                # Never pick DFS channels (52-64, 100-144) to avoid crashing AP
+            # When hotspot is active OR Non-DFS mode is toggled:
+            if (hs == 1 || ndfs == 1) {
+                # Never pick DFS channels (52-64, 100-144) to guarantee zero radar evictions
                 if ((chan >= 52 && chan <= 64) || (chan >= 100 && chan <= 144))
                     next
             }
             if (signal >= min) {
-                # Upgrade 2: 5 GHz and 00: twin bonus (+30 score points)
-                # Decisively prioritizes 100-170 Mbps 5GHz bands over crowded 2.4GHz bands
                 score = signal
-                if (chan > 14 || tolower(bssid) ~ /^58:61:63:00/) {
-                    score += 30
+                # Favor Non-DFS 5GHz bands (Ch 36-48, 149-165)
+                if ((chan >= 36 && chan <= 48) || (chan >= 149 && chan <= 165)) {
+                    score += 50
+                } else if (chan > 14 || tolower(bssid) ~ /^58:61:63:00/) {
+                    score += 35
                 }
                 print score, signal, bssid
             }
@@ -1312,7 +1397,7 @@ switch_to_bssid() {
             PREV_BSSID="${new_bssid:-$target}"
             SPEED_WINDOW=()
             adapt_hotspot_to_wifi "${new_bssid:-$target}"
-            reset_queue_penalties
+            reset_queue_penalties "${new_bssid:-$target}"
             return 0
         fi
         sleep 0.2
@@ -1336,7 +1421,7 @@ switch_to_bssid() {
         PREV_BSSID="${new_bssid:-$target}"
         SPEED_WINDOW=()
         adapt_hotspot_to_wifi "${new_bssid:-$target}"
-        reset_queue_penalties
+        reset_queue_penalties "${new_bssid:-$target}"
         return 0
     fi
 
@@ -1392,28 +1477,153 @@ recover_connection() {
         fi
     done <<< "$candidates"
 
+    # =========================================================================
+    # MULTI-STAGE SELF-HEALING FALLBACK (Alternatives 3 + 4 + 1)
+    # Triggers when all candidate BSSIDs fail to connect or route internet
+    # =========================================================================
     echo
-    echo -e "${RED}Top candidates failed. Fast-bailout to auto-roaming...${RESET}"
-    nmcli connection modify "$CONNECTION" 802-11-wireless.bssid ""
-    nmcli connection up "$CONNECTION" >/dev/null 2>&1 &
+    echo -e "${RED}All candidate BSSIDs failed. Initiating Multi-Stage Self-Healing...${RESET}"
 
-    local reset_bssid
-    reset_bssid=$(get_current_bssid)
-    if [ -n "$reset_bssid" ] && [ "${reset_bssid,,}" != "${initial_bssid,,}" ]; then
-        record_switch "$initial_bssid" "$reset_bssid" "Auto-Fallback" "$(get_signal)"
-        PREV_BSSID="$reset_bssid"
-        adapt_hotspot_to_wifi "$reset_bssid"
+    # --- STAGE 1 (Alternative 3): Re-apply DHCP Lease & Flush Gateway ARP Table ---
+    echo -e "${YELLOW}>> [STAGE 1] Refreshing DHCP lease & dynamic gateway on $INTERFACE...${RESET}"
+    nmcli device reapply "$INTERFACE" >/dev/null 2>&1
+    sleep 0.8
+    if internet_ok; then
+        local healed_bssid
+        healed_bssid=$(get_current_bssid)
+        local sig
+        sig=$(get_signal)
+        echo -e "${GREEN}>>> [SELF-HEALED: Stage 1] DHCP/Gateway refresh restored internet on ${healed_bssid:-$initial_bssid} (${sig:-N/A} dBm)!${RESET}"
+        record_switch "$initial_bssid" "${healed_bssid:-$initial_bssid}" "Self-Heal (DHCP)" "$sig"
+        PREV_BSSID="${healed_bssid:-$initial_bssid}"
+        adapt_hotspot_to_wifi "${healed_bssid:-$initial_bssid}"
+        reset_queue_penalties
+        return 0
     fi
 
+    # --- STAGE 2 (Alternative 4): Clear Queue Penalties & Unlock BSSID to Full Auto-Roam ---
+    echo -e "${YELLOW}>> [STAGE 2] Wiping queue failure penalties & unlocking BSSID lock...${RESET}"
+    reset_queue_penalties
+    unlock_bssid
+    nmcli connection up "$CONNECTION" >/dev/null 2>&1 &
+    sleep 1.5
+    if internet_ok; then
+        local healed_bssid
+        healed_bssid=$(get_current_bssid)
+        local sig
+        sig=$(get_signal)
+        echo -e "${GREEN}>>> [SELF-HEALED: Stage 2] Auto-roam unlocked & connected to ${healed_bssid:-Unknown} (${sig:-N/A} dBm)!${RESET}"
+        record_switch "$initial_bssid" "${healed_bssid:-Unknown}" "Self-Heal (Auto-Roam)" "$sig"
+        PREV_BSSID="${healed_bssid:-Unknown}"
+        adapt_hotspot_to_wifi "${healed_bssid:-Unknown}"
+        return 0
+    fi
+
+    # --- STAGE 3 (Alternative 1): Wi-Fi Radio Soft-Reset (Clear Stalled Kernel Driver / Supplicant) ---
+    echo -e "${YELLOW}>> [STAGE 3] Performing 1s Wi-Fi radio driver soft-reset...${RESET}"
+    nmcli radio wifi off
+    sleep 0.8
+    nmcli radio wifi on
+    sleep 1.5
+
+    # Re-trigger connection after driver reset
+    unlock_bssid
+    nmcli connection up "$CONNECTION" >/dev/null 2>&1 &
+    sleep 2.0
+
+    if internet_ok; then
+        local healed_bssid
+        healed_bssid=$(get_current_bssid)
+        local sig
+        sig=$(get_signal)
+        echo -e "${GREEN}>>> [SELF-HEALED: Stage 3] Driver soft-reset successfully restored connection on ${healed_bssid:-Unknown} (${sig:-N/A} dBm)!${RESET}"
+        record_switch "$initial_bssid" "${healed_bssid:-Unknown}" "Self-Heal (Radio-Reset)" "$sig"
+        PREV_BSSID="${healed_bssid:-Unknown}"
+        adapt_hotspot_to_wifi "${healed_bssid:-Unknown}"
+        reset_queue_penalties
+        return 0
+    fi
+
+    echo -e "${RED}Multi-Stage self-healing exhausted. Allowing NetworkManager autonomous recovery...${RESET}"
+    unlock_bssid
     sleep 1
     return 1
 }
 
+# Automatic Log Rotation (Upgrade 4: keeps logs lean and prevents slow disk operations)
+rotate_logs_if_needed() {
+    local max_lines=5000
+    local keep_lines=2500
+
+    if [ -f "$LOG_FILE" ]; then
+        local count
+        count=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$count" -gt "$max_lines" ]; then
+            tail -n "$keep_lines" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        fi
+    fi
+
+    if [ -f "$SPEED_LOG" ]; then
+        local count
+        count=$(wc -l < "$SPEED_LOG" 2>/dev/null || echo 0)
+        if [ "$count" -gt "$max_lines" ]; then
+            tail -n "$keep_lines" "$SPEED_LOG" > "${SPEED_LOG}.tmp" && mv "${SPEED_LOG}.tmp" "$SPEED_LOG"
+        fi
+    fi
+}
+
+# Run log maintenance on startup
+rotate_logs_if_needed
+
 # One-Shot CLI Modes (for Quick Settings Extension actions)
+if [ "$1" = "--swift" ]; then
+    echo "⚡ Swift Switch triggered: finding and switching to the best alternative AP..."
+    cur=$(get_current_bssid)
+    [ -n "$cur" ] && demote_candidate "$cur"
+    recover_connection
+    ret=$?
+    new_ap=$(get_current_bssid)
+    sig=$(get_signal)
+    ch=$(iw dev "$INTERFACE" info 2>/dev/null | awk '/channel/{print $2}')
+    band="2.4GHz"
+    [ -n "$ch" ] && [ "$ch" -gt 14 ] && band="5GHz"
+    send_notify "general" "normal" "⚡ Swift Switch Complete" "Connected to AP ${new_ap:-$cur} (Ch ${ch:-?}, ${band}, ${sig:-?} dBm)"
+    exit $ret
+fi
+
 if [ "$1" = "--roam-fastest" ] || [ "$1" = "--roam" ]; then
     echo "Scanning for fastest KLU_WIFI AP..."
     recover_connection
     exit $?
+fi
+
+if [ "$1" = "--non-dfs-on" ] || [ "$1" = "--non-dfs" ]; then
+    echo "Enabling Non-DFS Stability Mode..."
+    if [ -f "$CONF_FILE" ]; then
+        if grep -q 'NON_DFS_MODE=' "$CONF_FILE"; then
+            sed -i 's/NON_DFS_MODE=.*/NON_DFS_MODE="true"/' "$CONF_FILE"
+        else
+            echo 'NON_DFS_MODE="true"' >> "$CONF_FILE"
+        fi
+    else
+        echo 'NON_DFS_MODE="true"' > "$CONF_FILE"
+    fi
+    send_notify "general" "normal" "🛡️ Non-DFS AP Mode: ON" "Radar channels blocked. APs will stick to stable non-DFS frequencies."
+    # If currently on a DFS channel, gracefully roam to non-DFS immediately
+    cur_ch=$(iw dev "$INTERFACE" info 2>/dev/null | awk '/channel/{print $2}')
+    if ([ "$cur_ch" -ge 52 ] && [ "$cur_ch" -le 64 ]) || ([ "$cur_ch" -ge 100 ] && [ "$cur_ch" -le 144 ]); then
+        recover_connection
+    fi
+    exit 0
+fi
+
+if [ "$1" = "--non-dfs-off" ]; then
+    echo "Disabling Non-DFS Stability Mode..."
+    if [ -f "$CONF_FILE" ]; then
+        sed -i 's/NON_DFS_MODE=.*/NON_DFS_MODE="false"/' "$CONF_FILE"
+    fi
+    send_notify "general" "normal" "⚡ Non-DFS AP Mode: OFF" "All channels allowed. Top-tier 165+ Mbps APs unblocked."
+    exit 0
 fi
 
 if [ "$1" = "--speed-test" ]; then
@@ -1480,7 +1690,12 @@ while true; do
         if ! portal_reachable; then
             echo -e "${RED}>> [CRITICAL] Captive portal is DEAD/UNREACHABLE on this AP! Instant network switch!${RESET}"
         else
-            echo -e "${YELLOW}>> Captive portal reachable. Attempting fast AP recovery...${RESET}"
+            echo -e "${YELLOW}>> Captive portal reachable. Attempting fast session restore/recovery...${RESET}"
+            if auto_login_portal; then
+                echo -e "${GREEN}>> [RESTORED] Captive portal session restored. Continuing without roam.${RESET}"
+                fail_count=0
+                continue
+            fi
         fi
 
         unlock_bssid
