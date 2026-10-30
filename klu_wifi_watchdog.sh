@@ -26,10 +26,14 @@ SPEED_ROAM_COOLDOWN=60      # Minimum cooldown between speed-upgrade evaluations
 
 # Non-DFS Stability Mode: avoids radar channels (Ch 52-64, 100-144) to guarantee zero radar evictions
 NON_DFS_MODE=0
+FORCE_24GHZ=0
 CONF_FILE="$HOME/.config/klu-switch.conf"
 if [ -f "$CONF_FILE" ]; then
     if grep -q 'NON_DFS_MODE="true"' "$CONF_FILE" 2>/dev/null; then
         NON_DFS_MODE=1
+    fi
+    if grep -q 'FORCE_24GHZ="true"' "$CONF_FILE" 2>/dev/null; then
+        FORCE_24GHZ=1
     fi
 fi
 
@@ -675,6 +679,10 @@ get_rolling_avg_speed() {
 check_speed_upgrade() {
     # Stability-First Rule: Leave stable working connection alone; don't hunt high speed / no dancing
     [ "$ENABLE_SPEED_ROAM" -ne 1 ] && return 0
+    # If 2.4GHz Only mode is active, do not hunt 5GHz speeds
+    if [ -f "$CONF_FILE" ] && grep -q 'FORCE_24GHZ="true"' "$CONF_FILE" 2>/dev/null; then
+        return 0
+    fi
 
     local now
     now=$(date +%s)
@@ -771,8 +779,10 @@ check_signal_trend() {
 # Only reclaims if current internet is NOT stable/healthy, and favorite APs have not failed
 check_top_tier_reclaim() {
     [ "${ENABLE_TOP_TIER_RECLAIM:-0}" -ne 1 ] && return 0
-    # Do not reclaim if hotspot is currently active on single card (DFS safety) or Non-DFS mode is enabled
-    if is_hotspot_active || [ "$NON_DFS_MODE" -eq 1 ]; then
+    # Do not reclaim if hotspot is active, Non-DFS mode is enabled, or 2.4GHz Only mode is enabled
+    local f24=0
+    [ -f "$CONF_FILE" ] && grep -q 'FORCE_24GHZ="true"' "$CONF_FILE" 2>/dev/null && f24=1
+    if is_hotspot_active || [ "$NON_DFS_MODE" -eq 1 ] || [ "$f24" -eq 1 ]; then
         return 0
     fi
 
@@ -1298,30 +1308,38 @@ find_candidates() {
         hs_on=1
     fi
 
-    # Check live non-dfs flag from config file
+    # Check live non-dfs and 2.4GHz flags from config file
     local non_dfs=0
-    if [ -f "$CONF_FILE" ] && grep -q 'NON_DFS_MODE="true"' "$CONF_FILE" 2>/dev/null; then
-        non_dfs=1
+    local force_24=0
+    if [ -f "$CONF_FILE" ]; then
+        grep -q 'NON_DFS_MODE="true"' "$CONF_FILE" 2>/dev/null && non_dfs=1
+        grep -q 'FORCE_24GHZ="true"' "$CONF_FILE" 2>/dev/null && force_24=1
     fi
 
     local raw_candidates
     raw_candidates=$(nmcli -t -f BSSID,SSID,CHAN,SIGNAL device wifi list ifname "$INTERFACE" 2>/dev/null |
         sed 's/\\//g' |
-        awk -F: -v target="$TARGET_SSID" -v min="$MIN_SIGNAL" -v hs="$hs_on" -v ndfs="$non_dfs" '
+        awk -F: -v target="$TARGET_SSID" -v min="$MIN_SIGNAL" -v hs="$hs_on" -v ndfs="$non_dfs" -v f24="$force_24" '
         $7 == target {
             bssid=$1 ":" $2 ":" $3 ":" $4 ":" $5 ":" $6
             chan=$8
             signal=$9
-            # When hotspot is active OR Non-DFS mode is toggled:
-            if (hs == 1 || ndfs == 1) {
+            # When 2.4GHz Only mode is toggled:
+            if (f24 == 1) {
+                # Strictly only permit 2.4GHz channels (1 to 14)
+                if (chan > 14)
+                    next
+            } else if (hs == 1 || ndfs == 1) {
                 # Never pick DFS channels (52-64, 100-144) to guarantee zero radar evictions
                 if ((chan >= 52 && chan <= 64) || (chan >= 100 && chan <= 144))
                     next
             }
             if (signal >= min) {
                 score = signal
-                # Favor Non-DFS 5GHz bands (Ch 36-48, 149-165)
-                if ((chan >= 36 && chan <= 48) || (chan >= 149 && chan <= 165)) {
+                if (f24 == 1) {
+                    # Favor strongest pure 2.4GHz signal
+                    score += 15
+                } else if ((chan >= 36 && chan <= 48) || (chan >= 149 && chan <= 165)) {
                     score += 50
                 } else if (chan > 14 || tolower(bssid) ~ /^58:61:63:00/) {
                     score += 35
@@ -1623,6 +1641,35 @@ if [ "$1" = "--non-dfs-off" ]; then
         sed -i 's/NON_DFS_MODE=.*/NON_DFS_MODE="false"/' "$CONF_FILE"
     fi
     send_notify "general" "normal" "⚡ Non-DFS AP Mode: OFF" "All channels allowed. Top-tier 165+ Mbps APs unblocked."
+    exit 0
+fi
+
+if [ "$1" = "--24ghz-on" ] || [ "$1" = "--24ghz" ] || [ "$1" = "--force-24ghz-on" ]; then
+    echo "Enabling 2.4GHz Only Mode..."
+    if [ -f "$CONF_FILE" ]; then
+        if grep -q 'FORCE_24GHZ=' "$CONF_FILE"; then
+            sed -i 's/FORCE_24GHZ=.*/FORCE_24GHZ="true"/' "$CONF_FILE"
+        else
+            echo 'FORCE_24GHZ="true"' >> "$CONF_FILE"
+        fi
+    else
+        echo 'FORCE_24GHZ="true"' > "$CONF_FILE"
+    fi
+    send_notify "general" "normal" "📶 2.4GHz Only Mode: ON" "All 5GHz bands blocked. Locking strictly to 2.4GHz Wi-Fi."
+    # If currently on a 5GHz channel (chan > 14), roam immediately to a 2.4GHz AP
+    cur_ch=$(iw dev "$INTERFACE" info 2>/dev/null | awk '/channel/{print $2}')
+    if [ -n "$cur_ch" ] && [ "$cur_ch" -gt 14 ]; then
+        recover_connection
+    fi
+    exit 0
+fi
+
+if [ "$1" = "--24ghz-off" ] || [ "$1" = "--force-24ghz-off" ]; then
+    echo "Disabling 2.4GHz Only Mode..."
+    if [ -f "$CONF_FILE" ]; then
+        sed -i 's/FORCE_24GHZ=.*/FORCE_24GHZ="false"/' "$CONF_FILE"
+    fi
+    send_notify "general" "normal" "⚡ 2.4GHz Only Mode: OFF" "Dual-band operation restored (5GHz & 2.4GHz unblocked)."
     exit 0
 fi
 

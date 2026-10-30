@@ -38,7 +38,7 @@ function runCmd(args, callback = null) {
 }
 
 function loadNotifConfig() {
-    let conf = { master: true, speed: true, roam: true, nonDfs: false };
+    let conf = { master: true, speed: true, roam: true, nonDfs: false, force24: false };
     if (GLib.file_test(CONF_FILE, GLib.FileTest.EXISTS)) {
         try {
             let [ok, bytes] = GLib.file_get_contents(CONF_FILE);
@@ -49,6 +49,7 @@ function loadNotifConfig() {
                     if (line.includes('NOTIFY_SPEED=')) conf.speed = !line.includes('false');
                     if (line.includes('NOTIFY_ROAM=')) conf.roam = !line.includes('false');
                     if (line.includes('NON_DFS_MODE=')) conf.nonDfs = line.includes('true');
+                    if (line.includes('FORCE_24GHZ=')) conf.force24 = line.includes('true');
                 }
             }
         } catch (e) {}
@@ -60,7 +61,8 @@ function saveNotifConfig(conf) {
     let text = `NOTIFICATIONS_ENABLED="${conf.master}"\n` +
                `NOTIFY_SPEED="${conf.speed}"\n` +
                `NOTIFY_ROAM="${conf.roam}"\n` +
-               `NON_DFS_MODE="${conf.nonDfs}"\n`;
+               `NON_DFS_MODE="${conf.nonDfs}"\n` +
+               `FORCE_24GHZ="${conf.force24}"\n`;
     try {
         GLib.file_set_contents(CONF_FILE, text);
     } catch (e) {}
@@ -138,6 +140,14 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
             this._toggleNonDfs(state);
         });
         this.menu.addMenuItem(this._nonDfsSwitch);
+
+        // 2.4GHz Only Switch
+        this._force24Switch = new PopupMenu.PopupSwitchMenuItem('📶 Force 2.4GHz Band (Only)', this._notifConfig.force24);
+        this._force24Switch.connect('toggled', (item, state) => {
+            if (this._isUpdating) return;
+            this._toggleForce24(state);
+        });
+        this.menu.addMenuItem(this._force24Switch);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -243,6 +253,7 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
                 this._notifSpeedSwitch.setToggleState(this._notifConfig.speed);
                 this._notifRoamSwitch.setToggleState(this._notifConfig.roam);
                 this._nonDfsSwitch.setToggleState(this._notifConfig.nonDfs);
+                this._force24Switch.setToggleState(this._notifConfig.force24);
                 this._refreshState();
             }
         });
@@ -318,10 +329,33 @@ class KLUSwitchTopBarButton extends PanelMenu.Button {
         });
     }
 
+    _toggleForce24(enable) {
+        this._notifConfig.force24 = enable;
+        saveNotifConfig(this._notifConfig);
+        this._isUpdating = true;
+        this._force24Switch.setToggleState(enable);
+        if (this._extension && this._extension._quickIndicator && this._extension._quickIndicator._toggle) {
+            let qsSwitch = this._extension._quickIndicator._toggle._qsForce24Switch;
+            if (qsSwitch) qsSwitch.setToggleState(enable);
+        }
+        this._isUpdating = false;
+
+        let cmd = ['bash', WATCHDOG_SCRIPT, enable ? '--24ghz-on' : '--24ghz-off'];
+        runCmd(cmd, () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 800, () => {
+                this._refreshState();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+
     _refreshState() {
         let conf = loadNotifConfig();
         if (this._nonDfsSwitch) {
             this._nonDfsSwitch.setToggleState(conf.nonDfs);
+        }
+        if (this._force24Switch) {
+            this._force24Switch.setToggleState(conf.force24);
         }
         runCmd(['bash', STATUS_SCRIPT], (ok, stdout) => {
             if (this._destroyed || !this._watchdogSwitch) return;
@@ -439,6 +473,17 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
         });
         this.menu.addMenuItem(this._qsNonDfsSwitch);
 
+        // 2.4GHz Only Switch
+        let initialForce24 = loadNotifConfig().force24;
+        this._qsForce24Switch = new PopupMenu.PopupSwitchMenuItem('📶 Force 2.4GHz Band (Only)', initialForce24);
+        this._qsForce24Switch.connect('toggled', (item, state) => {
+            if (this._isUpdating) return;
+            if (this._extension && this._extension._topBarIndicator) {
+                this._extension._topBarIndicator._toggleForce24(state);
+            }
+        });
+        this.menu.addMenuItem(this._qsForce24Switch);
+
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // Swift Switch Button (Instant switch of BSSID)
@@ -509,6 +554,9 @@ class KLUSwitchQuickToggle extends QuickSettings.QuickMenuToggle {
         let conf = loadNotifConfig();
         if (this._qsNonDfsSwitch) {
             this._qsNonDfsSwitch.setToggleState(conf.nonDfs);
+        }
+        if (this._qsForce24Switch) {
+            this._qsForce24Switch.setToggleState(conf.force24);
         }
         this._isUpdating = false;
 
